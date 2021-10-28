@@ -19,4 +19,3 @@ rand = "0.8.4"
 
 [badges]
 maintenance = { status = "experimental" }
-github = { repository = "shelbyd/cooptex" }

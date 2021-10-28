@@ -1,4 +1,3 @@
-[![Workflow Status](https://github.com/shelbyd/cooptex/workflows/main/badge.svg)](https://github.com/shelbyd/cooptex/actions?query=workflow%3A%22main%22)
 ![Maintenance](https://img.shields.io/badge/maintenance-experimental-blue.svg)
 
 # cooptex
