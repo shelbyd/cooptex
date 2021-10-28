@@ -1,14 +1,54 @@
+#![warn(missing_docs)]
+
+//! cooptex provides deadlock-free Mutexes. The [`CoopMutex::lock`] method wraps the
+//! [`std::sync::Mutex`] return value with a `Result` that will request the caller to drop other held
+//! locks so another thread could make progress. This behavior is easily accomplished by using the
+//! [`retry_loop`] function.
+//!
+//! ```
+//! use cooptex::*;
+//! let a = CoopMutex::new(42);
+//! let b = CoopMutex::new(43);
+//!
+//! retry_loop(|| {
+//!   let a_lock = a.lock()?.unwrap();
+//!   let b_lock = b.lock()?.unwrap();
+//!   assert_eq!(*a_lock + *b_lock, 85);
+//!   Ok(())
+//! });
+//! ```
+//!
+//! # Guarantees
+//!
+//! This crate aims to guarantee that multiple threads cannot possibly deadlock by acquiring
+//! locks.
+//!
+//! The crate is still in early development, so there may be cases that aren't covered. Please open
+//! an issue if you can reproduce a deadlock.
+//!
+//! ## Non-Guarantees
+//!
+//! This crate allows the following potentially undesired behavior:
+//!
+//! - [`CoopMutex::lock`] may return [`Retry`] when it could wait and acquire the lock without
+//! a deadlock.
+//! - [`CoopMutex::lock`] may wait arbitrarily long before returning [`Retry`].
+//! - [`MutexGuard`] is not [`Send`], as we haven't fully evaluated the implications of sending
+//! `MutexGuard`s.
+//! - The current "Scheduler" for which thread has priority over locks is not fair.
+//! - [`retry_loop`] will spin-lock the calling thread until it can make progress.
+
 use std::sync::atomic::AtomicUsize;
 use std::sync::{PoisonError, TryLockError};
 
 #[cfg(feature = "loom")]
-pub(crate) use loom::{
+use loom::{
     sync::{Arc, Condvar, LockResult, Mutex, MutexGuard as StdMutexGuard},
     thread, thread_local,
 };
 
 #[cfg(not(feature = "loom"))]
-pub(crate) use std::{
+use std::{
     sync::{Arc, Condvar, LockResult, Mutex, MutexGuard as StdMutexGuard},
     thread, thread_local,
 };
@@ -20,21 +60,31 @@ thread_local!(
         LockScope::new(THREAD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 );
 
+/// A deadlock-free version of [`Mutex`](std::sync::Mutex).
+///
+/// This is only deadlock-free if:
+/// 1. All Mutexes that may deadlock are `CoopMutex`es
+/// 2. When [`Retry`] is returned, the requesting thread drops all other [`MutexGuard`]s it is holding.
+/// Easily accomplished with [`retry_loop`].
 pub struct CoopMutex<T> {
     native: Mutex<T>,
     held_waiter: Mutex<(Option<usize>, Option<usize>)>,
-    main_waiter: Condvar,
+    waiters: Condvar,
 }
 
 impl<T> CoopMutex<T> {
+    /// Create a new `CoopMutex` holding the provided `item`.
     pub fn new(item: T) -> Self {
         CoopMutex {
             native: Mutex::new(item),
             held_waiter: Mutex::new((None, None)),
-            main_waiter: Condvar::new(),
+            waiters: Condvar::new(),
         }
     }
 
+    /// Acquire a mutex or return `Err(Retry)`, indicating that the current thread should drop all
+    /// its currently held locks and try to acquire them again. Use [`retry_loop`] to automatically
+    /// use the correct behavior.
     pub fn lock(&self) -> Result<LockResult<MutexGuard<T>>, Retry> {
         THIS_SCOPE.with(|scope| scope.lock(self))
     }
@@ -71,18 +121,18 @@ impl LockScope {
                     (None, _) => break,
 
                     // A more important thread is waiting, we should drop all our locks.
-                    (_, Some(waiter)) if self.id > *waiter => return Err(Retry),
+                    (_, Some(waiter)) if self.id > *waiter => return Err(Retry::default()),
                     _ if Arc::strong_count(&self.lock_count) == 1 => {
-                        lock = mutex.main_waiter.wait(lock).unwrap();
+                        lock = mutex.waiters.wait(lock).unwrap();
                     }
                     // Already held by a more important thread, we should drop all our locks.
-                    (Some(holder), _) if self.id > *holder => return Err(Retry),
+                    (Some(holder), _) if self.id > *holder => return Err(Retry::default()),
 
                     // We become the primary waiter.
                     (_, waiter) => {
                         *waiter = Some(self.id);
-                        mutex.main_waiter.notify_all();
-                        lock = mutex.main_waiter.wait(lock).unwrap();
+                        mutex.waiters.notify_all();
+                        lock = mutex.waiters.wait(lock).unwrap();
                     }
                 }
             }
@@ -99,6 +149,7 @@ impl LockScope {
             native,
             mutex,
             _lock_count: Arc::clone(&self.lock_count),
+            _not_send: core::marker::PhantomData,
         }
     }
 
@@ -110,16 +161,19 @@ impl LockScope {
     }
 }
 
+/// A guard for a [`CoopMutex`]. Access the underlying data through [`Deref`](core::ops::Deref) and
+/// [`DerefMut`](core::ops::DerefMut).
 pub struct MutexGuard<'m, T> {
     native: StdMutexGuard<'m, T>,
     mutex: &'m CoopMutex<T>,
     _lock_count: Arc<()>,
+    _not_send: core::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl<'m, T> Drop for MutexGuard<'m, T> {
     fn drop(&mut self) {
         self.mutex.held_waiter.lock().unwrap().0 = None;
-        self.mutex.main_waiter.notify_all();
+        self.mutex.waiters.notify_all();
     }
 }
 
@@ -139,14 +193,47 @@ impl<'m, T> core::ops::DerefMut for MutexGuard<'m, T> {
 
 // TODO(shelbyd): Should be enum with From implementations.
 // Blocked on https://doc.rust-lang.org/std/ops/trait.Try.html being nightly-only.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Retry;
+/// Marker struct indicating that a thread requesting a [`CoopMutex`] should drop all its currently
+/// held [`MutexGuard`]s and attempt to reacquire them.
+///
+/// Use [`retry_loop`] to get the correct behavior.
+#[derive(Debug, PartialEq, Eq, Default)]
+pub struct Retry {
+    _disallow_matching: std::marker::PhantomData<()>,
+}
 
+/// Helper function for implementing the behavior of dropping held [`MutexGuard`]s when a
+/// [`CoopMutex::lock`] call returns [`Retry`].
+///
+/// You should use the early return operator `?` to raise any [`Retry`] errors. While the
+/// [`std::ops::Try`] trait is unstable, we can't allow using the early return operator for
+/// returning as normal user code would. We recommend having one function that acquires all
+/// relevant locks, and another that uses them.
+///
+/// ```
+/// use cooptex::*;
+/// let a = CoopMutex::new(42);
+/// let b = CoopMutex::new(43);
+///
+/// fn use_locks(a: &mut usize, b: &mut usize) -> Result<usize, ()> {
+///   *a += 1;
+///   *b += 1;
+///   Ok(*a + *b)
+/// }
+///
+/// let result = retry_loop(|| {
+///   let mut a_lock = a.lock()?.unwrap();
+///   let mut b_lock = b.lock()?.unwrap();
+///   Ok(use_locks(&mut a_lock, &mut b_lock))
+/// });
+///
+/// assert_eq!(result, Ok(87));
+/// ```
 pub fn retry_loop<T, F: FnMut() -> Result<T, Retry>>(mut f: F) -> T {
     loop {
         match f() {
             Ok(t) => return t,
-            Err(Retry) => {
+            Err(Retry { .. }) => {
                 thread::yield_now();
             }
         }
@@ -174,7 +261,7 @@ mod tests {
                 let _ = s1.lock(&b).unwrap();
             });
 
-            assert_eq!(s2.lock(&a).err(), Some(Retry));
+            assert_eq!(s2.lock(&a).err(), Some(Retry::default()));
 
             drop((x1, x2));
         })
