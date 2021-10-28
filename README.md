@@ -1,3 +1,6 @@
+[![Workflow Status](https://github.com/shelbyd/cooptex/workflows/main/badge.svg)](https://github.com/shelbyd/cooptex/actions?query=workflow%3A%22main%22)
+![Maintenance](https://img.shields.io/badge/maintenance-experimental-blue.svg)
+
 # cooptex
 
 cooptex provides deadlock-free Mutexes. The [`CoopMutex::lock`] method wraps the
@@ -37,3 +40,5 @@ a deadlock.
 `MutexGuard`s.
 - The current "Scheduler" for which thread has priority over locks is not fair.
 - [`retry_loop`] will spin-lock the calling thread until it can make progress.
+
+License: MIT
