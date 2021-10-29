@@ -33,10 +33,7 @@
 //! - [`CoopMutex::lock`] may return [`Retry`] when it could wait and acquire the lock without
 //! a deadlock.
 //! - [`CoopMutex::lock`] may wait arbitrarily long before returning [`Retry`].
-//! - [`MutexGuard`] is not [`Send`], as we haven't fully evaluated the implications of sending
-//! `MutexGuard`s.
 //! - The current "Scheduler" for which thread has priority over locks is not fair.
-//! - [`retry_loop`] will spin-lock the calling thread until it can make progress.
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::{PoisonError, TryLockError};
@@ -44,13 +41,13 @@ use std::sync::{PoisonError, TryLockError};
 #[cfg(feature = "loom")]
 use loom::{
     sync::{Arc, Condvar, LockResult, Mutex, MutexGuard as StdMutexGuard},
-    thread, thread_local,
+    thread_local,
 };
 
 #[cfg(not(feature = "loom"))]
 use std::{
     sync::{Arc, Condvar, LockResult, Mutex, MutexGuard as StdMutexGuard},
-    thread, thread_local,
+    thread_local,
 };
 
 static THREAD_ID: AtomicUsize = AtomicUsize::new(0);
@@ -68,9 +65,11 @@ thread_local!(
 /// Easily accomplished with [`retry_loop`].
 pub struct CoopMutex<T> {
     native: Mutex<T>,
-    held_waiter: Mutex<(Option<usize>, Option<usize>)>,
+    held_waiter: Mutex<HeldWaiter>,
     waiters: Condvar,
 }
+
+type HeldWaiter = (Option<usize>, Option<usize>);
 
 impl<T> CoopMutex<T> {
     /// Create a new `CoopMutex` holding the provided `item`.
@@ -96,7 +95,10 @@ struct LockScope {
 }
 
 impl LockScope {
-    fn lock<'m, T>(&self, mutex: &'m CoopMutex<T>) -> Result<LockResult<MutexGuard<'m, T>>, Retry> {
+    fn lock<'m, T>(
+        &self,
+        mutex: &'m CoopMutex<T>,
+    ) -> Result<LockResult<MutexGuard<'m, T>>, Retry<'m>> {
         self.lock_native(mutex).map(|result| match result {
             Ok(g) => Ok(self.guard(g, mutex)),
             Err(p) => Err(PoisonError::new(self.guard(p.into_inner(), mutex))),
@@ -106,7 +108,7 @@ impl LockScope {
     fn lock_native<'m, T>(
         &self,
         mutex: &'m CoopMutex<T>,
-    ) -> Result<LockResult<StdMutexGuard<'m, T>>, Retry> {
+    ) -> Result<LockResult<StdMutexGuard<'m, T>>, Retry<'m>> {
         loop {
             match mutex.native.try_lock() {
                 Ok(g) => return Ok(Ok(g)),
@@ -119,14 +121,20 @@ impl LockScope {
                 match &mut *lock {
                     // No one is holding the lock, retry the try_lock above.
                     (None, _) => break,
+                    (Some(holder), _) if self.id == *holder => {
+                        unreachable!("Already holding this lock")
+                    }
+                    (Some(holder), Some(waiter)) if holder == waiter => {
+                        unreachable!("Held and waited by same thread")
+                    }
 
                     // A more important thread is waiting, we should drop all our locks.
-                    (_, Some(waiter)) if self.id > *waiter => return Err(Retry::default()),
+                    (_, Some(waiter)) if self.id > *waiter => return Err(self.retry(mutex)),
                     _ if Arc::strong_count(&self.lock_count) == 1 => {
                         lock = mutex.waiters.wait(lock).unwrap();
                     }
                     // Already held by a more important thread, we should drop all our locks.
-                    (Some(holder), _) if self.id > *holder => return Err(Retry::default()),
+                    (Some(holder), _) if self.id > *holder => return Err(self.retry(mutex)),
 
                     // We become the primary waiter.
                     (_, waiter) => {
@@ -139,17 +147,26 @@ impl LockScope {
         }
     }
 
+    fn retry<'m, T>(&self, mutex: &'m CoopMutex<T>) -> Retry<'m> {
+        Retry {
+            waiters: &mutex.waiters,
+            mutex: &mutex.held_waiter,
+        }
+    }
+
     fn guard<'m, T>(
         &self,
         native: StdMutexGuard<'m, T>,
         mutex: &'m CoopMutex<T>,
     ) -> MutexGuard<'m, T> {
-        mutex.held_waiter.lock().unwrap().0 = Some(self.id);
+        let mut held_waiter = mutex.held_waiter.lock().unwrap();
+        held_waiter.0 = Some(self.id);
+        held_waiter.1 = None;
+
         MutexGuard {
             native,
             mutex,
             _lock_count: Arc::clone(&self.lock_count),
-            _not_send: core::marker::PhantomData,
         }
     }
 
@@ -167,7 +184,6 @@ pub struct MutexGuard<'m, T> {
     native: StdMutexGuard<'m, T>,
     mutex: &'m CoopMutex<T>,
     _lock_count: Arc<()>,
-    _not_send: core::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl<'m, T> Drop for MutexGuard<'m, T> {
@@ -197,9 +213,19 @@ impl<'m, T> core::ops::DerefMut for MutexGuard<'m, T> {
 /// held [`MutexGuard`]s and attempt to reacquire them.
 ///
 /// Use [`retry_loop`] to get the correct behavior.
-#[derive(Debug, PartialEq, Eq, Default)]
-pub struct Retry {
-    _disallow_matching: std::marker::PhantomData<()>,
+#[derive(Debug)]
+pub struct Retry<'m> {
+    mutex: &'m Mutex<HeldWaiter>,
+    waiters: &'m Condvar,
+}
+
+impl<'m> Retry<'m> {
+    fn wait(self) {
+        let mut lock = self.mutex.lock().unwrap();
+        while let Some(_) = lock.0 {
+            lock = self.waiters.wait(lock).unwrap();
+        }
+    }
 }
 
 /// Helper function for implementing the behavior of dropping held [`MutexGuard`]s when a
@@ -229,13 +255,11 @@ pub struct Retry {
 ///
 /// assert_eq!(result, Ok(87));
 /// ```
-pub fn retry_loop<T, F: FnMut() -> Result<T, Retry>>(mut f: F) -> T {
+pub fn retry_loop<'m, T, F: FnMut() -> Result<T, Retry<'m>>>(mut f: F) -> T {
     loop {
         match f() {
             Ok(t) => return t,
-            Err(Retry { .. }) => {
-                thread::yield_now();
-            }
+            Err(retry) => retry.wait(),
         }
     }
 }
@@ -261,7 +285,7 @@ mod tests {
                 let _ = s1.lock(&b).unwrap();
             });
 
-            assert_eq!(s2.lock(&a).err(), Some(Retry::default()));
+            assert!(s2.lock(&a).is_err());
 
             drop((x1, x2));
         })
@@ -317,7 +341,7 @@ mod loom_tests {
 
     #[test]
     #[ignore]
-    // Ignored because of https://github.com/tokio-rs/loom/issues/173.
+    // Ignored because our "spin-lock" overrides the maximum number of paths for loom.
     fn loom_deadlock() {
         loom::model(|| {
             let a = Arc::new(CoopMutex::new(42));

@@ -33,7 +33,7 @@ fn main() {
                         .iter()
                         .map(|mutex| mutex.lock())
                         .collect::<Result<Vec<_>, _>>()?;
-                    eprintln!("Thread {} acquired locks", i);
+                    eprintln!("Thread {:>3} acquired locks", i);
                     for lock in locks {
                         *lock.unwrap() += 1;
                     }
@@ -48,4 +48,6 @@ fn main() {
     for item in items {
         assert_eq!(*item.lock().unwrap().unwrap(), num_threads);
     }
+
+    eprintln!("All threads complete");
 }
