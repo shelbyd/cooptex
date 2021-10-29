@@ -28,12 +28,17 @@
 //!
 //! ## Non-Guarantees
 //!
-//! This crate allows the following potentially undesired behavior:
+//! This crate explicitly allows the following potentially undesired behavior:
 //!
 //! - [`CoopMutex::lock`] may return [`Retry`] when it could wait and acquire the lock without
 //! a deadlock.
 //! - [`CoopMutex::lock`] may wait arbitrarily long before returning [`Retry`].
+//!
+//! ## Incomplete
+//!
 //! - The current "Scheduler" for which thread has priority over locks is not fair.
+//! - We have not fully analyzed the behavior during panics. There is no `unsafe` code, so we could
+//! only possibly deadlock.
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::{PoisonError, TryLockError};
@@ -91,6 +96,8 @@ impl<T> CoopMutex<T> {
 
 struct LockScope {
     id: usize,
+    // TODO(shelbyd): This could be Rc<()> instead of Arc. Only internal tests would need to
+    // change.
     lock_count: Arc<()>,
 }
 
@@ -237,15 +244,15 @@ impl<'m> Retry<'m> {
 /// relevant locks, and another that uses them.
 ///
 /// ```
-/// use cooptex::*;
-/// let a = CoopMutex::new(42);
-/// let b = CoopMutex::new(43);
-///
 /// fn use_locks(a: &mut usize, b: &mut usize) -> Result<usize, ()> {
 ///   *a += 1;
 ///   *b += 1;
 ///   Ok(*a + *b)
 /// }
+///
+/// use cooptex::*;
+/// let a = CoopMutex::new(42);
+/// let b = CoopMutex::new(43);
 ///
 /// let result = retry_loop(|| {
 ///   let mut a_lock = a.lock()?.unwrap();
