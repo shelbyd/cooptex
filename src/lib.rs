@@ -23,6 +23,10 @@
 //! This crate aims to guarantee that multiple threads cannot possibly deadlock by acquiring
 //! locks.
 //!
+//! This crate also will prefer threads that have lived the "longest" without completing work.
+//! Meaning, when [`retry_loop`] successfully completes, it will move that thread to the end of the
+//! queue for acquiring future locks. This provides an approximately fair scheduler.
+//!
 //! The crate is still in early development, so there may be cases that aren't covered. Please open
 //! an issue if you can reproduce a deadlock.
 //!
@@ -36,10 +40,10 @@
 //!
 //! ## Incomplete
 //!
-//! - The current "Scheduler" for which thread has priority over locks is not fair.
 //! - We have not fully analyzed the behavior during panics. There is no `unsafe` code, so we could
 //! only possibly deadlock.
 
+use std::cell::RefCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{PoisonError, TryLockError};
 
@@ -58,8 +62,9 @@ use std::{
 static THREAD_ID: AtomicUsize = AtomicUsize::new(0);
 
 thread_local!(
-    static THIS_SCOPE: LockScope =
-        LockScope::new(THREAD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    static THIS_SCOPE: RefCell<LockScope> = RefCell::new(LockScope::new(
+        THREAD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    ));
 );
 
 /// A deadlock-free version of [`Mutex`](std::sync::Mutex).
@@ -89,8 +94,12 @@ impl<T> CoopMutex<T> {
     /// Acquire a mutex or return `Err(Retry)`, indicating that the current thread should drop all
     /// its currently held locks and try to acquire them again. Use [`retry_loop`] to automatically
     /// use the correct behavior.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread attempts to acquire a lock it is already holding.
     pub fn lock(&self) -> Result<LockResult<MutexGuard<T>>, Retry> {
-        THIS_SCOPE.with(|scope| scope.lock(self))
+        THIS_SCOPE.with(|scope| scope.borrow().lock(self))
     }
 }
 
@@ -183,6 +192,12 @@ impl LockScope {
             lock_count: Arc::new(()),
         }
     }
+
+    fn update_id_for_fairness(&mut self) {
+        if Arc::strong_count(&self.lock_count) == 1 {
+            self.id = THREAD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// A guard for a [`CoopMutex`]. Access the underlying data through [`Deref`](core::ops::Deref) and
@@ -265,7 +280,10 @@ impl<'m> Retry<'m> {
 pub fn retry_loop<'m, T, F: FnMut() -> Result<T, Retry<'m>>>(mut f: F) -> T {
     loop {
         match f() {
-            Ok(t) => return t,
+            Ok(t) => {
+                THIS_SCOPE.with(|s| s.borrow_mut().update_id_for_fairness());
+                return t;
+            }
             Err(retry) => retry.wait(),
         }
     }
