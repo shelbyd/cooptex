@@ -47,13 +47,13 @@ use std::cell::RefCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{PoisonError, TryLockError};
 
-#[cfg(feature = "loom")]
+#[cfg(feature = "loom-tests")]
 use loom::{
     sync::{Arc, Condvar, LockResult, Mutex, MutexGuard as StdMutexGuard},
     thread_local,
 };
 
-#[cfg(not(feature = "loom"))]
+#[cfg(not(feature = "loom-tests"))]
 use std::{
     sync::{Arc, Condvar, LockResult, Mutex, MutexGuard as StdMutexGuard},
     thread_local,
@@ -289,7 +289,7 @@ pub fn retry_loop<'m, T, F: FnMut() -> Result<T, Retry<'m>>>(mut f: F) -> T {
     }
 }
 
-#[cfg(all(test, not(feature = "loom")))]
+#[cfg(all(test, not(feature = "loom-tests")))]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -358,7 +358,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "loom"))]
+#[cfg(all(test, feature = "loom-tests"))]
 mod loom_tests {
     use super::*;
 
