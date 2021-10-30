@@ -73,6 +73,7 @@ thread_local!(
 /// 1. All Mutexes that may deadlock are `CoopMutex`es
 /// 2. When [`Retry`] is returned, the requesting thread drops all other [`MutexGuard`]s it is holding.
 /// Easily accomplished with [`retry_loop`].
+#[derive(Default)]
 pub struct CoopMutex<T> {
     native: Mutex<T>,
     held_waiter: Mutex<HeldWaiter>,
@@ -100,6 +101,25 @@ impl<T> CoopMutex<T> {
     /// Panics when a thread attempts to acquire a lock it is already holding.
     pub fn lock(&self) -> Result<LockResult<MutexGuard<T>>, Retry> {
         THIS_SCOPE.with(|scope| scope.borrow().lock(self))
+    }
+
+    /// Returns a mutable reference to the underlying data.
+    ///
+    /// See [`std::sync::Mutex`] for more details of implications.
+    pub fn get_mut(&mut self) -> LockResult<&mut T> {
+        self.native.get_mut()
+    }
+}
+
+impl<T: core::fmt::Debug> core::fmt::Debug for CoopMutex<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        self.native.fmt(f)
+    }
+}
+
+impl<T> From<T> for CoopMutex<T> {
+    fn from(t: T) -> Self {
+        CoopMutex::new(t)
     }
 }
 
