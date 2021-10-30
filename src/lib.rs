@@ -215,7 +215,7 @@ impl LockScope {
 
     fn update_id_for_fairness(&mut self) {
         if Arc::strong_count(&self.lock_count) == 1 {
-            self.id = THREAD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.id = THREAD_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
