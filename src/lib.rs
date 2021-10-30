@@ -78,6 +78,7 @@ pub struct CoopMutex<T> {
     native: Mutex<T>,
     held_waiter: Mutex<HeldWaiter>,
     waiters: Condvar,
+    primary_waiter: Condvar,
 }
 
 type HeldWaiter = (Option<usize>, Option<usize>);
@@ -89,6 +90,7 @@ impl<T> CoopMutex<T> {
             native: Mutex::new(item),
             held_waiter: Mutex::new((None, None)),
             waiters: Condvar::new(),
+            primary_waiter: Condvar::new(),
         }
     }
 
@@ -154,29 +156,31 @@ impl LockScope {
 
             let mut lock = mutex.held_waiter.lock().unwrap();
             loop {
-                match &mut *lock {
+                lock = match &mut *lock {
                     // No one is holding the lock, retry the try_lock above.
                     (None, _) => break,
+
                     (Some(holder), _) if self.id == *holder => {
-                        unreachable!("Already holding this lock")
+                        panic!("Attempted to lock a CoopMutex already held by this thread")
                     }
                     (Some(holder), Some(waiter)) if holder == waiter => {
                         unreachable!("Held and waited by same thread")
                     }
 
-                    // A more important thread is waiting, we should drop all our locks.
-                    (_, Some(waiter)) if self.id > *waiter => return Err(self.retry(mutex)),
-                    _ if Arc::strong_count(&self.lock_count) == 1 => {
-                        lock = mutex.waiters.wait(lock).unwrap();
-                    }
+                    // If holding no locks, it's impossible to cause a deadlock, so we can safely
+                    // wait.
+                    _ if self.active_locks() == 0 => mutex.waiters.wait(lock).unwrap(),
+
                     // Already held by a more important thread, we should drop all our locks.
                     (Some(holder), _) if self.id > *holder => return Err(self.retry(mutex)),
+                    // A more important thread is waiting, be a secondary waiter.
+                    (_, Some(waiter)) if self.id > *waiter => mutex.waiters.wait(lock).unwrap(),
 
-                    // We become the primary waiter.
-                    (_, waiter) => {
-                        *waiter = Some(self.id);
-                        mutex.waiters.notify_all();
-                        lock = mutex.waiters.wait(lock).unwrap();
+                    // Become the primary waiter.
+                    _ => {
+                        lock.1 = Some(self.id);
+                        mutex.primary_waiter.notify_one();
+                        mutex.primary_waiter.wait(lock).unwrap()
                     }
                 }
             }
@@ -213,8 +217,12 @@ impl LockScope {
         }
     }
 
+    fn active_locks(&self) -> usize {
+        Arc::strong_count(&self.lock_count) - 1
+    }
+
     fn update_id_for_fairness(&mut self) {
-        if Arc::strong_count(&self.lock_count) == 1 {
+        if self.active_locks() == 0 {
             self.id = THREAD_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -230,8 +238,14 @@ pub struct MutexGuard<'m, T> {
 
 impl<'m, T> Drop for MutexGuard<'m, T> {
     fn drop(&mut self) {
-        self.mutex.held_waiter.lock().unwrap().0 = None;
+        let mut held_waiter = self.mutex.held_waiter.lock().unwrap();
+        held_waiter.0 = None;
+
+        self.mutex.primary_waiter.notify_one();
         self.mutex.waiters.notify_all();
+
+        // Dropping this lock after notifying the condvars dramatically increases performance.
+        drop(held_waiter);
     }
 }
 
