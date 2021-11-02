@@ -18,7 +18,13 @@
 //! });
 //! ```
 //!
-//! # Guarantees
+//! The crate also provides a lower-overhead function [`lock`] which acquires a set of
+//! [`std::sync::Mutex`]es in a consistent order, to guarantee no deadlocks. Use that function if
+//! you can acquire all necessary locks at once.
+//!
+//! If you conditionally acquire locks, [`CoopMutex`] and [`retry_loop`] are likely necessary.
+//!
+//! # CoopMutex Guarantees
 //!
 //! This crate aims to guarantee that multiple threads cannot possibly deadlock by acquiring
 //! locks.
