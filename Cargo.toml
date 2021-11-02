@@ -11,6 +11,7 @@ license = "MIT"
 keywords = ["mutex", "deadlock", "concurrency"]
 
 [dependencies]
+frunk = "0.4.0"
 
 [dev-dependencies]
 loom = "0.5.2"

@@ -43,25 +43,20 @@
 //! - We have not fully analyzed the behavior during panics. There is no `unsafe` code, so we could
 //! only possibly deadlock.
 
+pub mod lock_in_order;
+pub use lock_in_order::lock;
+
+mod sync;
+use sync::MutexGuard as StdMutexGuard;
+use sync::*;
+
 use std::cell::RefCell;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{PoisonError, TryLockError};
 
-#[cfg(feature = "loom-tests")]
-use loom::{
-    sync::{Arc, Condvar, LockResult, Mutex, MutexGuard as StdMutexGuard},
-    thread_local,
-};
-
-#[cfg(not(feature = "loom-tests"))]
-use std::{
-    sync::{Arc, Condvar, LockResult, Mutex, MutexGuard as StdMutexGuard},
-    thread_local,
-};
-
 static THREAD_ID: AtomicUsize = AtomicUsize::new(0);
 
-thread_local!(
+sync::thread_local!(
     static THIS_SCOPE: RefCell<LockScope> = RefCell::new(LockScope::new(
         THREAD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
@@ -108,6 +103,7 @@ impl<T> CoopMutex<T> {
     /// Returns a mutable reference to the underlying data.
     ///
     /// See [`std::sync::Mutex`] for more details of implications.
+    #[cfg(not(feature = "loom-tests"))]
     pub fn get_mut(&mut self) -> LockResult<&mut T> {
         self.native.get_mut()
     }

@@ -1,8 +1,10 @@
-use cooptex::{retry_loop, CoopMutex};
+use cooptex::{lock, lock_in_order::Unwrap};
+
+use frunk::{hlist, hlist_pat};
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 fn main() {
@@ -11,14 +13,14 @@ fn main() {
 
     let accounts = Arc::new(
         (0..num_accounts)
-            .map(|_| CoopMutex::new(1000))
+            .map(|_| Mutex::new(1000))
             .collect::<Vec<_>>(),
     );
 
     let started = Arc::new(AtomicUsize::new(0));
 
     (0..num_threads)
-        .map(|i| {
+        .map(|_| {
             let accounts = accounts.clone();
             let started = started.clone();
             std::thread::spawn(move || {
@@ -32,14 +34,10 @@ fn main() {
                 let from = accounts.next().unwrap();
                 let to = accounts.next().unwrap();
 
-                retry_loop(|| {
-                    let mut from = from.lock()?.unwrap();
-                    let mut to = to.lock()?.unwrap();
-                    eprintln!("Thread {:>3} doing transfer", i);
-                    *from -= 3;
-                    *to += 3;
-                    Ok(())
-                });
+                let hlist_pat![mut from, mut to] = lock(hlist![from, to]).unwrap();
+                eprintln!("{:?} doing transfer", std::thread::current().id());
+                *from -= 3;
+                *to += 3;
             })
         })
         .collect::<Vec<_>>()
