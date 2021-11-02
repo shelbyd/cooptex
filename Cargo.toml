@@ -12,6 +12,7 @@ keywords = ["mutex", "deadlock", "concurrency"]
 
 [dependencies]
 frunk = "0.4.0"
+itertools = "0.10.1"
 
 [dev-dependencies]
 loom = "0.5.2"

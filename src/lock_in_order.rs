@@ -7,6 +7,7 @@
 use crate::sync::{LockResult, Mutex, MutexGuard};
 
 use frunk::{HCons, HNil};
+use itertools::Itertools;
 
 /// Lock a list of [`Mutex`]es in a consistent order regardless of input order.
 ///
@@ -71,9 +72,36 @@ pub enum Bound {
 
 pub trait LockSequence {
     type Output;
+
+    fn lock_in_order(self) -> Self::Output;
+}
+
+impl<'l, 'm, T> LockSequence for &'l [&'m Mutex<T>] {
+    type Output = Vec<LockResult<MutexGuard<'m, T>>>;
+
+    fn lock_in_order(self) -> Self::Output {
+        self.iter()
+            .enumerate()
+            .sorted_by_key(|(_, m)| mutex_ptr(m))
+            .map(|(i, m)| (i, m.lock()))
+            .sorted_by_key(|(i, _)| *i)
+            .map(|(_, l)| l)
+            .collect()
+    }
+}
+
+pub trait LockMaybe {
+    type Output;
     type Maybe: LockOrder<Locked = Self::Output>;
 
     fn as_maybe(self) -> Self::Maybe;
+}
+
+impl<L> LockSequence for L
+where
+    L: LockMaybe,
+{
+    type Output = L::Output;
 
     fn lock_in_order(self) -> Self::Output
     where
@@ -83,7 +111,7 @@ pub trait LockSequence {
     }
 }
 
-impl LockSequence for HNil {
+impl LockMaybe for HNil {
     type Output = HNil;
     type Maybe = HNil;
 
@@ -92,9 +120,9 @@ impl LockSequence for HNil {
     }
 }
 
-impl<'m, H, Tail> LockSequence for HCons<&'m Mutex<H>, Tail>
+impl<'m, H, Tail> LockMaybe for HCons<&'m Mutex<H>, Tail>
 where
-    Tail: LockSequence,
+    Tail: LockMaybe,
 {
     type Output = HCons<LockResult<MutexGuard<'m, H>>, Tail::Output>;
     type Maybe = HCons<MaybeLocked<'m, H>, Tail::Maybe>;
@@ -190,6 +218,17 @@ where
             head: h.unwrap(),
             tail: tail.unwrap(),
         }
+    }
+}
+
+impl<R, E> Unwrap for Vec<Result<R, E>>
+where
+    E: core::fmt::Debug,
+{
+    type Output = Vec<R>;
+
+    fn unwrap(self) -> Self::Output {
+        self.into_iter().map(|r| r.unwrap()).collect()
     }
 }
 
