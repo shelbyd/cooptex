@@ -27,8 +27,8 @@ use itertools::Itertools;
 /// let hlist_pat!(a, b) = lock(hlist!(&a, &b)).unwrap();
 /// assert_eq!(*a + *b, 3);
 /// ```
-pub fn lock<L: LockSequence>(l: L) -> L::Output {
-    l.lock_in_order()
+pub async fn lock<L: LockSequence>(l: L) -> L::Output {
+    l.lock_in_order().await
 }
 
 fn mutex_ptr<T>(t: &Mutex<T>) -> *const () {
@@ -103,11 +103,11 @@ where
 {
     type Output = L::Output;
 
-    fn lock_in_order(self) -> Self::Output
+    async fn lock_in_order(self) -> Self::Output
     where
         Self: Sized,
     {
-        self.as_maybe().lock_in_order(Bound::None).as_locked()
+        self.as_maybe().lock_in_order(Bound::None).await.as_locked()
     }
 }
 

@@ -1,4 +1,5 @@
 #![warn(missing_docs)]
+#![cfg_attr(feature = "async", feature(async_closure))]
 
 //! cooptex provides deadlock-free Mutexes. The [`CoopMutex::lock`] method wraps the
 //! [`std::sync::Mutex`] return value with a `Result` that will request the caller to drop other held
@@ -76,8 +77,8 @@ sync::thread_local!(
 /// Easily accomplished with [`retry_loop`].
 #[derive(Default)]
 pub struct CoopMutex<T> {
-    native: Mutex<T>,
-    held_waiter: Mutex<HeldWaiter>,
+    native: tokio::sync::Mutex<T>,
+    held_waiter: tokio::sync::Mutex<HeldWaiter>,
     waiters: Condvar,
     primary_waiter: Condvar,
 }
@@ -88,8 +89,8 @@ impl<T> CoopMutex<T> {
     /// Create a new `CoopMutex` holding the provided `item`.
     pub fn new(item: T) -> Self {
         CoopMutex {
-            native: Mutex::new(item),
-            held_waiter: Mutex::new((None, None)),
+            native: tokio::sync::Mutex::new(item),
+            held_waiter: tokio::sync::Mutex::new((None, None)),
             waiters: Condvar::new(),
             primary_waiter: Condvar::new(),
         }
@@ -102,8 +103,8 @@ impl<T> CoopMutex<T> {
     /// # Panics
     ///
     /// Panics when a thread attempts to acquire a lock it is already holding.
-    pub fn lock(&self) -> Result<LockResult<MutexGuard<T>>, Retry> {
-        THIS_SCOPE.with(|scope| scope.borrow().lock(self))
+    pub async fn lock(&self) -> Result<LockResult<MutexGuard<T>>, Retry> {
+        THIS_SCOPE.with(|scope| scope.borrow().lock(self)).await
     }
 
     /// Returns a mutable reference to the underlying data.
@@ -265,7 +266,7 @@ impl<'m, T> core::ops::DerefMut for MutexGuard<'m, T> {
     }
 }
 
-// TODO(shelbyd): Should be enum with From implementations.
+// TODO: Should be enum with From implementations.
 // Blocked on https://doc.rust-lang.org/std/ops/trait.Try.html being nightly-only.
 /// Marker struct indicating that a thread requesting a [`CoopMutex`] should drop all its currently
 /// held [`MutexGuard`]s and attempt to reacquire them.
@@ -391,51 +392,5 @@ mod tests {
             assert_eq!(*s2.lock(&mutex).unwrap().unwrap(), 42);
         })
         .unwrap();
-    }
-}
-
-#[cfg(all(test, feature = "loom-tests"))]
-mod loom_tests {
-    use super::*;
-
-    use loom::{self, sync::Arc};
-
-    #[test]
-    #[ignore]
-    // Ignored because our "spin-lock" overrides the maximum number of paths for loom.
-    fn loom_deadlock() {
-        loom::model(|| {
-            let a = Arc::new(CoopMutex::new(42));
-            let b = Arc::new(CoopMutex::new(43));
-
-            let t1 = {
-                let a = a.clone();
-                let b = b.clone();
-                loom::thread::spawn(move || {
-                    retry_loop(|| {
-                        let a = a.lock()?.unwrap();
-                        let mut b = b.lock()?.unwrap();
-                        *b += *a;
-                        Ok(())
-                    });
-                })
-            };
-
-            let t2 = {
-                let a = a.clone();
-                let b = b.clone();
-                loom::thread::spawn(move || {
-                    retry_loop(|| {
-                        let b = b.lock()?.unwrap();
-                        let mut a = a.lock()?.unwrap();
-                        *a += *b;
-                        Ok(())
-                    });
-                })
-            };
-
-            t1.join().unwrap();
-            t2.join().unwrap();
-        });
     }
 }
